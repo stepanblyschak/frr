@@ -51,6 +51,7 @@
 #include "zebra/kernel_netlink.h"
 #include "zebra/rt_netlink.h"
 #include "zebra/debug.h"
+#include "fpm/fpm.h"
 
 #define SOUTHBOUND_DEFAULT_ADDR INADDR_LOOPBACK
 #define SOUTHBOUND_DEFAULT_PORT 2620
@@ -461,7 +462,11 @@ static void fpm_reconnect(struct fpm_nl_ctx *fnc)
 static int fpm_read(struct thread *t)
 {
 	struct fpm_nl_ctx *fnc = THREAD_ARG(t);
+	fpm_msg_hdr_t fpm;
 	ssize_t rv;
+	char buf[8192];
+	struct nlmsghdr *hdr;
+	struct zebra_dplane_ctx *ctx;
 
 	/* Let's ignore the input at the moment. */
 	rv = stream_read_try(fnc->ibuf, fnc->socket,
@@ -493,12 +498,83 @@ static int fpm_read(struct thread *t)
 	if (rv == -2)
 		return 0;
 
-	stream_reset(fnc->ibuf);
-
 	/* Account all bytes read. */
 	atomic_fetch_add_explicit(&fnc->counters.bytes_read, rv,
 				  memory_order_relaxed);
 
+	while (rv) {
+		if (rv < (ssize_t)FPM_MSG_HDR_LEN) {
+			stream_reset(fnc->ibuf);
+			zlog_warn(
+				"%s: Received %zd bytes but cannot even read fpm header, ignoring",
+				__func__, rv);
+
+			FPM_RECONNECT(fnc);
+			return 0;
+		}
+
+		fpm.version = stream_getc(fnc->ibuf);
+		fpm.msg_type = stream_getc(fnc->ibuf);
+		fpm.msg_len = stream_getw(fnc->ibuf);
+
+		if (fpm.version != FPM_PROTO_VERSION &&
+		    fpm.msg_type != FPM_MSG_TYPE_NETLINK) {
+			stream_reset(fnc->ibuf);
+			zlog_warn(
+				"%s: Received version/msg_type %u/%u, expected 1/1",
+				__func__, fpm.version, fpm.msg_type);
+
+			FPM_RECONNECT(fnc);
+			return 0;
+		}
+
+		if (fpm.msg_len != rv) {
+			stream_reset(fnc->ibuf);
+			zlog_warn(
+				"%s: Received message length %u but read only got %zd, ignoring message",
+				__func__, fpm.msg_len, rv);
+
+			FPM_RECONNECT(fnc);
+			return 0;
+		}
+
+		/*
+		 * Place the data from the stream into a buffer
+		 */
+		hdr = (struct nlmsghdr *)buf;
+		if (sizeof(buf) < fpm.msg_len) {
+			stream_reset(fnc->ibuf);
+			zlog_warn(
+				"%s: Received unexpected large message data: %u",
+				__func__, fpm.msg_len);
+			FPM_RECONNECT(fnc);
+			return 0;
+		}
+
+		stream_get(buf, fnc->ibuf, fpm.msg_len - FPM_MSG_HDR_LEN);
+		rv -= fpm.msg_len;
+
+		switch (hdr->nlmsg_type) {
+		case RTM_NEWROUTE:
+			ctx = dplane_ctx_alloc();
+			dplane_ctx_set_op(ctx, DPLANE_OP_ROUTE_NOTIFY);
+			if (netlink_route_change_read_unicast_internal(
+				    hdr, 0, false, ctx) != 1) {
+				dplane_ctx_fini(&ctx);
+				stream_pulldown(fnc->ibuf);
+				return 0;
+			}
+			break;
+		default:
+			if (IS_ZEBRA_DEBUG_FPM)
+				zlog_debug(
+					"%s: Received message type %u which is not currently handled",
+					__func__, hdr->nlmsg_type);
+			break;
+		}
+	}
+
+	stream_reset(fnc->ibuf);
 	return 0;
 }
 
